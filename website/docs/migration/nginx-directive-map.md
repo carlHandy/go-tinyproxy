@@ -87,14 +87,19 @@ Full reference mapping every nginx directive (open-source and nginx Plus) to its
 
 ## URL Routing & Rewriting
 
-| nginx directive | tinyproxy | Status |
-|---|---|---|
-| `location` | — | ❌ |
-| `rewrite` | — | ❌ |
-| `try_files` | — | ❌ |
-| `return` | — | ❌ |
-| `map` | — | ❌ |
-| `if` | — | ❌ |
+| nginx directive | tinyproxy | Status | Notes |
+|---|---|---|---|
+| `location` (prefix) | `location /path/ { }` | ✅ | Longest prefix wins |
+| `location =` (exact) | `location = /path { }` | ✅ | Wins immediately |
+| `location ~` (regex) | `location ~ pattern { }` | ✅ | Case-sensitive; first declared wins |
+| `location ~*` (regex, case-insensitive) | `location ~ pattern { }` | ⚠️ | Mapped to `~`; case-insensitivity dropped with comment |
+| `location ^~` (prefix, no-regex) | `location /path/ { }` | ⚠️ | Mapped to plain prefix; priority semantics not preserved |
+| `return 3xx <url>` | `redirect <code> <url>` | ✅ | Inside location blocks; 3xx codes only |
+| `rewrite` | — | ❌ | |
+| `try_files` | — | ❌ | |
+| `return` (non-redirect) | — | ❌ | 2xx/4xx/5xx return codes not supported |
+| `map` | — | ❌ | |
+| `if` | — | ❌ | |
 
 ## Proxy Headers & Timeouts
 

@@ -89,6 +89,54 @@ Available strategies:
 - `weighted`
 - `cookie` (Sticky sessions)
 
+### Location Blocks (URL Routing)
+
+Route requests to different handlers based on path. Three match types are supported, evaluated in priority order: exact → regex → longest prefix.
+
+```text
+example.com {
+    proxy_pass http://default-backend:8080   # vhost-level fallback
+
+    location = /health {                     # exact match — highest priority
+        proxy_pass http://health:8081
+    }
+
+    location /api/ {                         # prefix match — longest wins
+        proxy_pass http://api-backend:3000
+        security {
+            rate_limit { requests 1000 window 1m }
+        }
+    }
+
+    location ~ \.php$ {                      # regex match — beats prefix
+        fastcgi {
+            pass 127.0.0.1:9000
+            index index.php
+            param SCRIPT_FILENAME /var/www/html/$fastcgi_script_name
+        }
+    }
+
+    location /old-path/ {                    # redirect
+        redirect 301 https://example.com/new-path/
+    }
+}
+```
+
+**Match modifiers:**
+
+| Modifier | Type | Priority |
+|---|---|---|
+| `=` | Exact | Highest — wins immediately |
+| `~` | Regex (case-sensitive) | Second — first declared wins |
+| _(none)_ | Prefix | Lowest — longest match wins |
+
+**Directives allowed inside a location block:**
+
+- **Handler** (exactly one): `proxy_pass`, `root`, `redirect <code> <url>`, `fastcgi { }`, `upstream { }`
+- **Middleware overrides**: `compression on|off`, `security { }`, `bot_protection { }`, `cache { }`
+
+A location block inherits all vhost-level settings. Middleware directives inside a location block replace the vhost-level setting wholesale for matched requests.
+
 ### Response Caching
 Cache upstream responses in memory.
 ```text

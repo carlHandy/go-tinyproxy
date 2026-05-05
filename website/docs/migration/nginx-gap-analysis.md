@@ -24,9 +24,11 @@ location / {
 }
 ```
 
-**Status:** Not supported. tinyproxy operates at the virtual host level — all requests for a vhost go to the same backend or root. Every nginx config that splits traffic by path requires `location` blocks.
+**Status:** ✅ **Supported.** `location` blocks are fully supported with prefix, exact (`=`), and regex (`~`) matching. Per-location handlers (`proxy_pass`, `root`, `redirect`, `fastcgi`, `upstream`) and middleware overrides (`compression`, `security`, `bot_protection`, `cache`) are all supported.
 
-**Planned:** Prefix, exact (`=`), and regex matching with per-location `proxy_pass`/`root`/`redirect`.
+Match priority: exact `=` > regex `~` (first declared) > longest prefix.
+
+See the [vhosts configuration reference](/docs/configuration/vhosts#location-blocks-url-routing) for syntax and examples.
 
 ---
 
@@ -37,9 +39,15 @@ location / {
 return 301 https://example.com$request_uri;
 ```
 
-**Status:** Not supported.
+**Status:** ✅ **Supported** inside `location` blocks via the `redirect` directive:
 
-**Planned:** `redirect` directive at the vhost level and (once location routing lands) per-location redirects.
+```text
+location /old-path/ {
+    redirect 301 https://example.com/new-path/
+}
+```
+
+Valid codes are 300–399.
 
 ---
 
