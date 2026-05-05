@@ -8,6 +8,7 @@ import (
     "strings"
     "time"
 
+    "tinyproxy/internal/cache"
     "tinyproxy/internal/loadbalancer"
 )
 
@@ -71,6 +72,10 @@ func (p *Parser) parseVhosts() error {
 
             if err := p.parseVHostBlock(); err != nil {
                 return err
+            }
+
+            if err := ApplyLocations(p.currentVHost); err != nil {
+                return fmt.Errorf("vhost %q: %w", domain, err)
             }
 
             p.config.VHosts[domain] = p.currentVHost
@@ -158,6 +163,11 @@ func (p *Parser) parseLine(line string) error {
             return fmt.Errorf("max_body_size: %w", err)
         }
         p.currentVHost.MaxBodySize = size
+    case "location":
+        if len(parts) < 3 || parts[len(parts)-1] != "{" {
+            return fmt.Errorf("location block requires a pattern and must end with {")
+        }
+        return p.parseLocation(parts[1 : len(parts)-1])
     case "ssl", "security", "socks5", "fastcgi", "bot_protection", "cache", "upstream":
         if len(parts) != 2 || parts[1] != "{" {
             return fmt.Errorf("%q block must be opened with %q", parts[0], parts[0]+" {")
@@ -564,6 +574,186 @@ func (p *Parser) parseHealthCheck() error {
         }
     }
     return fmt.Errorf("unexpected end of file: missing closing } for health_check block")
+}
+
+func (p *Parser) parseLocation(modAndPattern []string) error {
+    loc := LocationConfig{}
+    switch len(modAndPattern) {
+    case 1:
+        loc.Pattern = modAndPattern[0]
+        loc.MatchType = LocationMatchPrefix
+    case 2:
+        switch modAndPattern[0] {
+        case "=":
+            loc.Pattern = modAndPattern[1]
+            loc.MatchType = LocationMatchExact
+        case "~":
+            loc.Pattern = modAndPattern[1]
+            loc.MatchType = LocationMatchRegex
+        default:
+            return fmt.Errorf("unknown location modifier %q (supported: =, ~ or no modifier)", modAndPattern[0])
+        }
+    default:
+        return fmt.Errorf("invalid location block: unexpected tokens before {")
+    }
+    if err := p.parseLocationBlock(&loc); err != nil {
+        return err
+    }
+    p.currentVHost.Locations = append(p.currentVHost.Locations, loc)
+    return nil
+}
+
+func (p *Parser) parseLocationBlock(loc *LocationConfig) error {
+    found := false
+    for p.scanner.Scan() {
+        p.line++
+        line := strings.TrimSpace(p.scanner.Text())
+        if line == "" || strings.HasPrefix(line, "#") {
+            continue
+        }
+        if line == "}" {
+            found = true
+            break
+        }
+        parts := strings.Fields(line)
+        if len(parts) == 0 {
+            continue
+        }
+        switch parts[0] {
+        case "proxy_pass":
+            if len(parts) < 2 {
+                return fmt.Errorf("proxy_pass requires a URL")
+            }
+            loc.Overrides.ProxyPass = parts[1]
+        case "root":
+            if len(parts) < 2 {
+                return fmt.Errorf("root requires a path")
+            }
+            loc.Overrides.Root = parts[1]
+        case "redirect":
+            if len(parts) < 3 {
+                return fmt.Errorf("redirect requires a status code and URL")
+            }
+            code, err := strconv.Atoi(parts[1])
+            if err != nil {
+                return fmt.Errorf("invalid redirect code %q: must be an integer", parts[1])
+            }
+            loc.Overrides.Redirect = &RedirectConfig{Code: code, URL: parts[2]}
+        case "compression":
+            if len(parts) < 2 {
+                return fmt.Errorf("compression requires on or off")
+            }
+            switch parts[1] {
+            case "on":
+                loc.Overrides.SetCompression = true
+                loc.Overrides.Compression = true
+            case "off":
+                loc.Overrides.SetCompression = true
+                loc.Overrides.Compression = false
+            default:
+                return fmt.Errorf("invalid compression value %q: must be on or off", parts[1])
+            }
+        case "security":
+            if len(parts) != 2 || parts[1] != "{" {
+                return fmt.Errorf(`security block must be opened with "security {"`)
+            }
+            saved := p.currentVHost
+            scratch := &VirtualHost{}
+            p.currentVHost = scratch
+            err := p.parseSecurity()
+            p.currentVHost = saved
+            if err != nil {
+                return err
+            }
+            loc.Overrides.SetSecurity = true
+            loc.Overrides.Security = scratch.Security
+        case "bot_protection":
+            if len(parts) != 2 || parts[1] != "{" {
+                return fmt.Errorf(`bot_protection block must be opened with "bot_protection {"`)
+            }
+            saved := p.currentVHost
+            scratch := &VirtualHost{}
+            p.currentVHost = scratch
+            err := p.parseBotProtection()
+            p.currentVHost = saved
+            if err != nil {
+                return err
+            }
+            loc.Overrides.SetBotProtection = true
+            loc.Overrides.BotProtection = scratch.BotProtection
+        case "cache":
+            if len(parts) != 2 || parts[1] != "{" {
+                return fmt.Errorf(`cache block must be opened with "cache {"`)
+            }
+            saved := p.currentVHost
+            scratch := &VirtualHost{Cache: cache.DefaultCacheConfig()}
+            p.currentVHost = scratch
+            err := p.parseCache()
+            p.currentVHost = saved
+            if err != nil {
+                return err
+            }
+            loc.Overrides.SetCache = true
+            loc.Overrides.Cache = scratch.Cache
+        case "fastcgi":
+            if len(parts) != 2 || parts[1] != "{" {
+                return fmt.Errorf(`fastcgi block must be opened with "fastcgi {"`)
+            }
+            saved := p.currentVHost
+            scratch := &VirtualHost{}
+            scratch.FastCGI.Params = make(map[string]string)
+            p.currentVHost = scratch
+            err := p.parseFastCGI()
+            p.currentVHost = saved
+            if err != nil {
+                return err
+            }
+            loc.Overrides.FastCGI = FastCGIConfig{
+                Pass:   scratch.FastCGI.Pass,
+                Index:  scratch.FastCGI.Index,
+                Params: scratch.FastCGI.Params,
+            }
+        case "upstream":
+            if len(parts) != 2 || parts[1] != "{" {
+                return fmt.Errorf(`upstream block must be opened with "upstream {"`)
+            }
+            saved := p.currentVHost
+            scratch := &VirtualHost{Upstream: loadbalancer.DefaultLBConfig()}
+            p.currentVHost = scratch
+            err := p.parseUpstream()
+            p.currentVHost = saved
+            if err != nil {
+                return err
+            }
+            loc.Overrides.Upstream = scratch.Upstream
+        default:
+            return fmt.Errorf("unknown location directive %q", parts[0])
+        }
+    }
+    if !found {
+        return fmt.Errorf("unexpected end of file: missing closing } for location %q", loc.Pattern)
+    }
+    // Validate: exactly one handler must be set
+    handlers := 0
+    if loc.Overrides.ProxyPass != "" {
+        handlers++
+    }
+    if loc.Overrides.Root != "" {
+        handlers++
+    }
+    if loc.Overrides.Redirect != nil {
+        handlers++
+    }
+    if loc.Overrides.FastCGI.Pass != "" {
+        handlers++
+    }
+    if len(loc.Overrides.Upstream.Backends) > 0 {
+        handlers++
+    }
+    if handlers == 0 {
+        return fmt.Errorf("location %q: no handler directive specified (proxy_pass, root, redirect, fastcgi, or upstream)", loc.Pattern)
+    }
+    return nil
 }
 
 // parseByteSize parses human-readable byte sizes like "256MB", "1GB", "512KB".
