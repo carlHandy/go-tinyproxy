@@ -99,6 +99,20 @@ func MergeLocation(base *VirtualHost, loc *LocationConfig) *VirtualHost {
 	eff.Locations = nil // effective vhosts don't carry nested locations
 	eff.Redirect = nil  // clear vhost-level redirect before applying handler
 
+	// Deep-copy reference fields to prevent aliasing between base and effective vhost
+	if len(eff.FastCGI.Params) > 0 {
+		cp := make(map[string]string, len(eff.FastCGI.Params))
+		for k, v := range eff.FastCGI.Params {
+			cp[k] = v
+		}
+		eff.FastCGI.Params = cp
+	}
+	bp := &eff.BotProtection
+	bp.BlockedAgents = append([]string(nil), bp.BlockedAgents...)
+	bp.AllowedAgents = append([]string(nil), bp.AllowedAgents...)
+	bp.BlockedPaths = append([]string(nil), bp.BlockedPaths...)
+	eff.Cache.Methods = append([]string(nil), eff.Cache.Methods...)
+
 	o := loc.Overrides
 	switch {
 	case o.ProxyPass != "":
