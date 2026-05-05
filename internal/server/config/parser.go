@@ -638,6 +638,9 @@ func (p *Parser) parseLocationBlock(loc *LocationConfig) error {
             if err != nil {
                 return fmt.Errorf("invalid redirect code %q: must be an integer", parts[1])
             }
+            if code < 300 || code > 399 {
+                return fmt.Errorf("invalid redirect code %d: must be a 3xx redirect status code", code)
+            }
             loc.Overrides.Redirect = &RedirectConfig{Code: code, URL: parts[2]}
         case "compression":
             if len(parts) < 2 {
