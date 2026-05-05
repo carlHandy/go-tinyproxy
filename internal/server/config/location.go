@@ -71,7 +71,8 @@ func MatchLocation(locations []LocationConfig, path string) *LocationConfig {
 		if locations[i].MatchType != LocationMatchPrefix {
 			continue
 		}
-		if strings.HasPrefix(path, locations[i].Pattern) {
+		pat := locations[i].Pattern
+		if path == pat || strings.HasPrefix(path, strings.TrimSuffix(pat, "/")+"/") {
 			if best == nil || len(locations[i].Pattern) > len(best.Pattern) {
 				best = &locations[i]
 			}

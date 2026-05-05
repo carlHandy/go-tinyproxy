@@ -108,3 +108,13 @@ func TestMatchLocation_PrefixCandidateBeatsUnmatchedRegex(t *testing.T) {
 		t.Errorf("expected prefix, got MatchType=%v", got.MatchType)
 	}
 }
+
+func TestMatchLocation_PrefixDoesNotMatchBoundaryViolation(t *testing.T) {
+	locs := []LocationConfig{
+		{Pattern: "/api", MatchType: LocationMatchPrefix},
+	}
+	got := MatchLocation(locs, "/apifoo")
+	if got != nil {
+		t.Errorf("expected nil for /apifoo against /api prefix, got match on %q", got.Pattern)
+	}
+}
