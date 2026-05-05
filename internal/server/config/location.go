@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -89,4 +90,78 @@ func MatchLocation(locations []LocationConfig, path string) *LocationConfig {
 	}
 
 	return best
+}
+
+// MergeLocation clones base and applies location overrides to produce the
+// effective VirtualHost for requests matching loc.
+func MergeLocation(base *VirtualHost, loc *LocationConfig) *VirtualHost {
+	eff := *base
+	eff.Locations = nil // effective vhosts don't carry nested locations
+	eff.Redirect = nil  // clear vhost-level redirect before applying handler
+
+	o := loc.Overrides
+	switch {
+	case o.ProxyPass != "":
+		eff.ProxyPass = o.ProxyPass
+		eff.Root = ""
+		eff.Redirect = nil
+		eff.FastCGI = FastCGIConfig{}
+		eff.Upstream = loadbalancer.DefaultLBConfig()
+	case o.Root != "":
+		eff.Root = o.Root
+		eff.ProxyPass = ""
+		eff.Redirect = nil
+		eff.FastCGI = FastCGIConfig{}
+		eff.Upstream = loadbalancer.DefaultLBConfig()
+	case o.Redirect != nil:
+		eff.Redirect = o.Redirect
+		eff.ProxyPass = ""
+		eff.Root = ""
+		eff.FastCGI = FastCGIConfig{}
+		eff.Upstream = loadbalancer.DefaultLBConfig()
+	case o.FastCGI.Pass != "":
+		eff.FastCGI = o.FastCGI
+		eff.ProxyPass = ""
+		eff.Root = ""
+		eff.Redirect = nil
+		eff.Upstream = loadbalancer.DefaultLBConfig()
+	case len(o.Upstream.Backends) > 0:
+		eff.Upstream = o.Upstream
+		eff.ProxyPass = ""
+		eff.Root = ""
+		eff.Redirect = nil
+		eff.FastCGI = FastCGIConfig{}
+	}
+
+	if o.SetCompression {
+		eff.Compression = o.Compression
+	}
+	if o.SetSecurity {
+		eff.Security = o.Security
+	}
+	if o.SetBotProtection {
+		eff.BotProtection = o.BotProtection
+	}
+	if o.SetCache {
+		eff.Cache = o.Cache
+	}
+
+	return &eff
+}
+
+// ApplyLocations compiles regexes and pre-computes effective VirtualHosts for
+// all locations. Must be called after the parent vhost is fully parsed.
+func ApplyLocations(vhost *VirtualHost) error {
+	for i := range vhost.Locations {
+		loc := &vhost.Locations[i]
+		if loc.MatchType == LocationMatchRegex {
+			re, err := regexp.Compile(loc.Pattern)
+			if err != nil {
+				return fmt.Errorf("location %q: invalid regex: %w", loc.Pattern, err)
+			}
+			loc.compiledRegex = re
+		}
+		loc.Effective = MergeLocation(vhost, loc)
+	}
+	return nil
 }
