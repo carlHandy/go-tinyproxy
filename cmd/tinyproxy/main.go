@@ -227,6 +227,10 @@ func (vh *VHostHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !exists {
 		vhost = cfg.VHosts["default"]
 	}
+	if vhost == nil {
+		http.Error(w, "Not Found", http.StatusNotFound)
+		return
+	}
 
 	locationKey := host
 	if loc := config.MatchLocation(vhost.Locations, r.URL.Path); loc != nil {
