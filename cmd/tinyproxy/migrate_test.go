@@ -398,3 +398,180 @@ func TestRenderReport_Counts(t *testing.T) {
 		t.Errorf("missing directive in report:\n%s", rpt)
 	}
 }
+
+// ── Location block migration tests ─────────────────────────────────────────
+
+func TestConvertServerBlock_LocationProxyPass(t *testing.T) {
+	dirs := crossplane.Directives{
+		{Directive: "server_name", Args: []string{"example.com"}},
+		{Directive: "listen", Args: []string{"80"}},
+		{Directive: "proxy_pass", Args: []string{"http://default:8080"}},
+		{
+			Directive: "location",
+			Args:      []string{"/api/"},
+			Block: crossplane.Directives{
+				{Directive: "proxy_pass", Args: []string{"http://api:3000"}},
+			},
+		},
+	}
+	mc := &migrateConf{report: reportConf{}}
+	vh := mc.convertServerBlock(dirs, nil, nil, "")
+	if len(vh.locations) != 1 {
+		t.Fatalf("got %d locations, want 1", len(vh.locations))
+	}
+	loc := vh.locations[0]
+	if loc.pattern != "/api/" {
+		t.Errorf("pattern = %q, want /api/", loc.pattern)
+	}
+	if loc.modifier != "" {
+		t.Errorf("modifier = %q, want empty", loc.modifier)
+	}
+	if loc.proxyPass != "http://api:3000" {
+		t.Errorf("proxyPass = %q", loc.proxyPass)
+	}
+}
+
+func TestConvertServerBlock_LocationExactModifier(t *testing.T) {
+	dirs := crossplane.Directives{
+		{Directive: "server_name", Args: []string{"example.com"}},
+		{Directive: "listen", Args: []string{"80"}},
+		{
+			Directive: "location",
+			Args:      []string{"=", "/health"},
+			Block: crossplane.Directives{
+				{Directive: "proxy_pass", Args: []string{"http://health:8081"}},
+			},
+		},
+	}
+	mc := &migrateConf{report: reportConf{}}
+	vh := mc.convertServerBlock(dirs, nil, nil, "")
+	if len(vh.locations) != 1 {
+		t.Fatalf("got %d locations, want 1", len(vh.locations))
+	}
+	if vh.locations[0].modifier != "=" {
+		t.Errorf("modifier = %q, want =", vh.locations[0].modifier)
+	}
+}
+
+func TestConvertServerBlock_LocationReturn301(t *testing.T) {
+	dirs := crossplane.Directives{
+		{Directive: "server_name", Args: []string{"example.com"}},
+		{Directive: "listen", Args: []string{"80"}},
+		{
+			Directive: "location",
+			Args:      []string{"/old/"},
+			Block: crossplane.Directives{
+				{Directive: "return", Args: []string{"301", "https://example.com/new/"}},
+			},
+		},
+	}
+	mc := &migrateConf{report: reportConf{}}
+	vh := mc.convertServerBlock(dirs, nil, nil, "")
+	if len(vh.locations) != 1 {
+		t.Fatalf("got %d locations, want 1", len(vh.locations))
+	}
+	loc := vh.locations[0]
+	if loc.redirect == nil {
+		t.Fatal("redirect is nil")
+	}
+	if loc.redirect.code != 301 {
+		t.Errorf("code = %d, want 301", loc.redirect.code)
+	}
+	if loc.redirect.url != "https://example.com/new/" {
+		t.Errorf("url = %q", loc.redirect.url)
+	}
+}
+
+func TestConvertServerBlock_LocationUnsupportedInnerDirective(t *testing.T) {
+	dirs := crossplane.Directives{
+		{Directive: "server_name", Args: []string{"example.com"}},
+		{Directive: "listen", Args: []string{"80"}},
+		{
+			Directive: "location",
+			Args:      []string{"/secure/"},
+			Block: crossplane.Directives{
+				{Directive: "proxy_pass", Args: []string{"http://api:3000"}},
+				{Directive: "auth_basic", Args: []string{"\"Admin Area\""}},
+			},
+		},
+	}
+	mc := &migrateConf{report: reportConf{}}
+	vh := mc.convertServerBlock(dirs, nil, nil, "")
+	if len(vh.locations) != 1 {
+		t.Fatalf("got %d locations, want 1", len(vh.locations))
+	}
+	loc := vh.locations[0]
+	if loc.proxyPass != "http://api:3000" {
+		t.Errorf("proxyPass = %q", loc.proxyPass)
+	}
+	if len(loc.stubs) != 1 {
+		t.Fatalf("got %d stubs in location, want 1 (for auth_basic)", len(loc.stubs))
+	}
+	if loc.stubs[0].tag != "auth_basic" {
+		t.Errorf("stub tag = %q, want auth_basic", loc.stubs[0].tag)
+	}
+}
+
+func TestRenderVhostConf_LocationBlocks(t *testing.T) {
+	mc := &migrateConf{
+		vhosts: []*vhostConf{
+			{
+				hostname:  "example.com",
+				proxyPass: "http://default:8080",
+				locations: []locationConf{
+					{pattern: "/api/", proxyPass: "http://api:3000"},
+					{pattern: "/health", modifier: "=", proxyPass: "http://health:8081"},
+				},
+			},
+		},
+	}
+	out := renderVhostConf(mc)
+	if !strings.Contains(out, "location /api/ {") {
+		t.Errorf("missing location /api/ block:\n%s", out)
+	}
+	if !strings.Contains(out, "location = /health {") {
+		t.Errorf("missing location = /health block:\n%s", out)
+	}
+	if !strings.Contains(out, "proxy_pass http://api:3000") {
+		t.Errorf("missing proxy_pass for /api/ location:\n%s", out)
+	}
+}
+
+func TestRenderVhostConf_LocationCaseInsensitiveComment(t *testing.T) {
+	mc := &migrateConf{
+		vhosts: []*vhostConf{
+			{
+				hostname: "example.com",
+				root:     "/var/www",
+				locations: []locationConf{
+					{pattern: `\.php$`, modifier: "~*", proxyPass: "http://fpm:9000"},
+				},
+			},
+		},
+	}
+	out := renderVhostConf(mc)
+	if !strings.Contains(out, "location ~ ") {
+		t.Errorf("~* should render as ~:\n%s", out)
+	}
+	if !strings.Contains(out, "case-insensitive") {
+		t.Errorf("should have note about case-insensitive conversion:\n%s", out)
+	}
+}
+
+func TestRenderVhostConf_LocationRedirect(t *testing.T) {
+	mc := &migrateConf{
+		vhosts: []*vhostConf{
+			{
+				hostname: "example.com",
+				root:     "/var/www",
+				locations: []locationConf{
+					{pattern: "/old/", redirect: &redirectConf{code: 301, url: "https://example.com/new/"}},
+				},
+			},
+		},
+	}
+	out := renderVhostConf(mc)
+	if !strings.Contains(out, "redirect 301 https://example.com/new/") {
+		t.Errorf("missing redirect directive:\n%s", out)
+	}
+}

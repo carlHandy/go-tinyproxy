@@ -29,6 +29,7 @@ type vhostConf struct {
 	fastcgi     *fastcgiConf
 	upstream    *upstreamConf
 	maxBodySize string // e.g. "20MB"; empty = not set
+	locations   []locationConf
 	stubs       []inlineStub
 }
 
@@ -54,6 +55,23 @@ type upstreamConf struct {
 	strategy string
 	backends []string // "http://host:port [weight N]"
 	stubs    []inlineStub
+}
+
+type redirectConf struct {
+	code int
+	url  string
+}
+
+type locationConf struct {
+	modifier    string // "", "=", "~", "~*", "^~"
+	pattern     string
+	proxyPass   string
+	root        string
+	redirect    *redirectConf
+	fastcgi     *fastcgiConf
+	upstream    *upstreamConf
+	compression string
+	stubs       []inlineStub
 }
 
 type inlineStub struct {
@@ -87,7 +105,6 @@ type reportEntry struct {
 // ── Unsupported directive table ───────────────────────────────────────────────
 
 var unsupportedDirectives = map[string][2]string{
-	"location":              {"No URL routing in tinyproxy", "url-routing"},
 	"rewrite":               {"URL rewriting not supported", "rewrites"},
 	"map":                   {"map directive not supported", "map"},
 	"if":                    {"if blocks not supported", "conditionals"},
@@ -338,6 +355,10 @@ func (mc *migrateConf) convertServerBlock(
 				mc.report.converted++
 			}
 
+		case "location":
+			loc := mc.convertLocationBlock(d, vh, upstreams, rateZones)
+			vh.locations = append(vh.locations, loc)
+
 		default:
 			if !silentDirectives[d.Directive] {
 				if reason, ok := unsupportedDirectives[d.Directive]; ok {
@@ -445,6 +466,139 @@ func (mc *migrateConf) addStub(vh *vhostConf, d *crossplane.Directive, reason, a
 	})
 }
 
+func (mc *migrateConf) convertLocationBlock(
+	d *crossplane.Directive,
+	vh *vhostConf,
+	upstreams map[string]crossplane.Directives,
+	rateZones map[string]rateLimitConf,
+) locationConf {
+	var modifier, pattern string
+	switch len(d.Args) {
+	case 1:
+		pattern = d.Args[0]
+	case 2:
+		modifier = d.Args[0]
+		pattern = d.Args[1]
+	}
+
+	loc := locationConf{modifier: modifier, pattern: pattern}
+
+	for _, inner := range d.Block {
+		switch inner.Directive {
+		case "proxy_pass":
+			if len(inner.Args) == 0 {
+				continue
+			}
+			target := inner.Args[0]
+			if name := upstreamName(target); name != "" {
+				if uDirs, ok := upstreams[name]; ok {
+					uc, stubs := convertUpstreamBlock(uDirs)
+					loc.upstream = uc
+					loc.stubs = append(loc.stubs, stubs...)
+					mc.report.converted++
+					continue
+				}
+			}
+			loc.proxyPass = target
+			mc.report.converted++
+
+		case "root":
+			if len(inner.Args) > 0 {
+				loc.root = inner.Args[0]
+				mc.report.converted++
+			}
+
+		case "return":
+			if len(inner.Args) >= 2 {
+				code, err := strconv.Atoi(inner.Args[0])
+				if err == nil {
+					loc.redirect = &redirectConf{code: code, url: inner.Args[1]}
+					mc.report.converted++
+				}
+			}
+
+		case "gzip":
+			if len(inner.Args) > 0 {
+				loc.compression = inner.Args[0]
+				mc.report.converted++
+			}
+
+		case "add_header":
+			loc.stubs = append(loc.stubs, inlineStub{
+				tag:    inner.Directive,
+				raw:    directiveToRaw(inner),
+				reason: "add_header inside location blocks is not supported",
+				anchor: "add-header",
+			})
+			mc.report.stubbed++
+			mc.report.entries = append(mc.report.entries, reportEntry{
+				vhost:     vh.hostname,
+				directive: inner.Directive,
+				line:      inner.Line,
+				reason:    "add_header inside location blocks is not supported",
+			})
+
+		case "fastcgi_pass":
+			if len(inner.Args) > 0 {
+				if loc.fastcgi == nil {
+					loc.fastcgi = &fastcgiConf{}
+				}
+				loc.fastcgi.pass = inner.Args[0]
+				mc.report.converted++
+			}
+
+		case "fastcgi_index":
+			if len(inner.Args) > 0 {
+				if loc.fastcgi == nil {
+					loc.fastcgi = &fastcgiConf{}
+				}
+				loc.fastcgi.index = inner.Args[0]
+				mc.report.converted++
+			}
+
+		case "fastcgi_param":
+			if len(inner.Args) >= 2 {
+				if loc.fastcgi == nil {
+					loc.fastcgi = &fastcgiConf{}
+				}
+				loc.fastcgi.params = append(loc.fastcgi.params, inner.Args[0]+" "+strings.Join(inner.Args[1:], " "))
+				mc.report.converted++
+			}
+
+		default:
+			if !silentDirectives[inner.Directive] {
+				if reason, ok := unsupportedDirectives[inner.Directive]; ok {
+					loc.stubs = append(loc.stubs, inlineStub{
+						tag:    inner.Directive,
+						raw:    directiveToRaw(inner),
+						reason: reason[0],
+						anchor: reason[1],
+					})
+					mc.report.stubbed++
+					mc.report.entries = append(mc.report.entries, reportEntry{
+						vhost:     vh.hostname,
+						directive: inner.Directive,
+						line:      inner.Line,
+						reason:    reason[0],
+					})
+				}
+			}
+		}
+	}
+	return loc
+}
+
+func locationModifierComment(mod string) string {
+	switch mod {
+	case "~*":
+		return "# Note: ~* (case-insensitive) converted to ~ (case-sensitive)"
+	case "^~":
+		return "# Note: ^~ converted to plain prefix (^~ priority semantics not preserved)"
+	default:
+		return ""
+	}
+}
+
 // ── Output rendering ──────────────────────────────────────────────────────────
 
 const docsBase = "https://tinyproxy.io/docs/migration/nginx-gap-analysis"
@@ -533,6 +687,60 @@ func renderVhostConf(mc *migrateConf) string {
 				fmt.Fprintf(&sb, "            # → %s\n", s.reason)
 				fmt.Fprintf(&sb, "            # → See: %s#%s\n", docsBase, s.anchor)
 				sb.WriteString("\n")
+			}
+			sb.WriteString("        }\n")
+		}
+
+		for _, loc := range vh.locations {
+			mod := ""
+			switch loc.modifier {
+			case "=":
+				mod = "= "
+			case "~", "~*":
+				mod = "~ "
+			}
+			fmt.Fprintf(&sb, "        location %s%s {\n", mod, loc.pattern)
+			if comment := locationModifierComment(loc.modifier); comment != "" {
+				fmt.Fprintf(&sb, "            %s\n", comment)
+			}
+			if loc.proxyPass != "" {
+				fmt.Fprintf(&sb, "            proxy_pass %s\n", loc.proxyPass)
+			}
+			if loc.root != "" {
+				fmt.Fprintf(&sb, "            root %s\n", loc.root)
+			}
+			if loc.redirect != nil {
+				fmt.Fprintf(&sb, "            redirect %d %s\n", loc.redirect.code, loc.redirect.url)
+			}
+			if loc.compression != "" {
+				fmt.Fprintf(&sb, "            compression %s\n", loc.compression)
+			}
+			if loc.fastcgi != nil {
+				sb.WriteString("            fastcgi {\n")
+				if loc.fastcgi.pass != "" {
+					fmt.Fprintf(&sb, "                pass %s\n", loc.fastcgi.pass)
+				}
+				if loc.fastcgi.index != "" {
+					fmt.Fprintf(&sb, "                index %s\n", loc.fastcgi.index)
+				}
+				for _, p := range loc.fastcgi.params {
+					fmt.Fprintf(&sb, "                param %s\n", p)
+				}
+				sb.WriteString("            }\n")
+			}
+			if loc.upstream != nil {
+				sb.WriteString("            upstream {\n")
+				fmt.Fprintf(&sb, "                strategy %s\n", loc.upstream.strategy)
+				for _, b := range loc.upstream.backends {
+					fmt.Fprintf(&sb, "                backend %s\n", b)
+				}
+				sb.WriteString("            }\n")
+			}
+			for _, s := range loc.stubs {
+				sb.WriteString("\n")
+				fmt.Fprintf(&sb, "            # UNSUPPORTED[%s]: %s\n", s.tag, s.raw)
+				fmt.Fprintf(&sb, "            # → %s\n", s.reason)
+				fmt.Fprintf(&sb, "            # → See: %s#%s\n", docsBase, s.anchor)
 			}
 			sb.WriteString("        }\n")
 		}
