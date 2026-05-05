@@ -156,21 +156,32 @@ func (vh *VHostHandler) initSubsystems() {
 	vh.balancers = make(map[string]*loadbalancer.LoadBalancer)
 
 	for name, vhost := range vh.config.VHosts {
-		if vhost.Cache.Enabled {
-			vh.caches[name] = cache.New(vhost.Cache.MaxSize)
-			log.Printf("cache enabled for vhost %q (max %d bytes, TTL %s)",
-				name, vhost.Cache.MaxSize, vhost.Cache.DefaultTTL)
+		vh.initSubsystemsForVHost(name, vhost)
+		for _, loc := range vhost.Locations {
+			key := name + ":" + loc.Pattern
+			vh.initSubsystemsForVHost(key, loc.Effective)
 		}
-		if len(vhost.Upstream.Backends) > 0 {
-			lb, err := loadbalancer.New(vhost.Upstream)
-			if err != nil {
-				log.Printf("WARNING: failed to init load balancer for vhost %q: %v", name, err)
-				continue
-			}
-			vh.balancers[name] = lb
-			log.Printf("load balancer enabled for vhost %q (strategy %s, %d backends)",
-				name, vhost.Upstream.Strategy, len(vhost.Upstream.Backends))
+	}
+}
+
+func (vh *VHostHandler) initSubsystemsForVHost(key string, vhost *config.VirtualHost) {
+	if vhost == nil {
+		return
+	}
+	if vhost.Cache.Enabled {
+		vh.caches[key] = cache.New(vhost.Cache.MaxSize)
+		log.Printf("cache enabled for vhost %q (max %d bytes, TTL %s)",
+			key, vhost.Cache.MaxSize, vhost.Cache.DefaultTTL)
+	}
+	if len(vhost.Upstream.Backends) > 0 {
+		lb, err := loadbalancer.New(vhost.Upstream)
+		if err != nil {
+			log.Printf("WARNING: failed to init load balancer for vhost %q: %v", key, err)
+			return
 		}
+		vh.balancers[key] = lb
+		log.Printf("load balancer enabled for vhost %q (strategy %s, %d backends)",
+			key, vhost.Upstream.Strategy, len(vhost.Upstream.Backends))
 	}
 }
 
@@ -217,6 +228,12 @@ func (vh *VHostHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		vhost = cfg.VHosts["default"]
 	}
 
+	locationKey := host
+	if loc := config.MatchLocation(vhost.Locations, r.URL.Path); loc != nil {
+		vhost = loc.Effective
+		locationKey = host + ":" + loc.Pattern
+	}
+
 	fp := fingerprint.FromContext(r.Context())
 	if fingerprint.IsBlocked(bl, fp) {
 		log.Printf("BLOCKING TLS fingerprint: %s %s JA3=%s JA4=%s", r.Method, r.URL.Path, fp.JA3, fp.JA4)
@@ -249,17 +266,17 @@ func (vh *VHostHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if vhost.Compression {
 			coreHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				compression.Compress(func(w http.ResponseWriter, r *http.Request) {
-					vh.handleVHost(w, r, vhost, balancers[host])
+					vh.handleVHost(w, r, vhost, balancers[locationKey])
 				})(w, r)
 			})
 		} else {
 			coreHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				vh.handleVHost(w, r, vhost, balancers[host])
+				vh.handleVHost(w, r, vhost, balancers[locationKey])
 			})
 		}
 
 		// Wrap with cache middleware if enabled
-		if c, ok := caches[host]; ok {
+		if c, ok := caches[locationKey]; ok {
 			coreHandler = cache.Handler(vhost.Cache, c)(coreHandler)
 		}
 
@@ -300,6 +317,11 @@ func (vh *VHostHandler) setSecurityHeaders(w http.ResponseWriter, vhost *config.
 }
 
 func (vh *VHostHandler) handleVHost(w http.ResponseWriter, r *http.Request, vhost *config.VirtualHost, lb *loadbalancer.LoadBalancer) {
+	if vhost.Redirect != nil {
+		http.Redirect(w, r, vhost.Redirect.URL, vhost.Redirect.Code)
+		return
+	}
+
 	if vhost.FastCGI.Pass != "" {
 		fastcgi.Handler(w, r, vhost.FastCGI.Pass, vhost.Root, vhost.FastCGI.Index)
 		return
