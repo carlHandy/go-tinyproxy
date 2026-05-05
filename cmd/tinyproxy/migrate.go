@@ -356,7 +356,7 @@ func (mc *migrateConf) convertServerBlock(
 			}
 
 		case "location":
-			loc := mc.convertLocationBlock(d, upstreams, rateZones)
+			loc := mc.convertLocationBlock(d, vh, upstreams, rateZones)
 			vh.locations = append(vh.locations, loc)
 
 		default:
@@ -468,6 +468,7 @@ func (mc *migrateConf) addStub(vh *vhostConf, d *crossplane.Directive, reason, a
 
 func (mc *migrateConf) convertLocationBlock(
 	d *crossplane.Directive,
+	vh *vhostConf,
 	upstreams map[string]crossplane.Directives,
 	rateZones map[string]rateLimitConf,
 ) locationConf {
@@ -523,7 +524,19 @@ func (mc *migrateConf) convertLocationBlock(
 			}
 
 		case "add_header":
-			mc.report.converted++
+			loc.stubs = append(loc.stubs, inlineStub{
+				tag:    inner.Directive,
+				raw:    directiveToRaw(inner),
+				reason: "add_header inside location blocks is not supported",
+				anchor: "add-header",
+			})
+			mc.report.stubbed++
+			mc.report.entries = append(mc.report.entries, reportEntry{
+				vhost:     vh.hostname,
+				directive: inner.Directive,
+				line:      inner.Line,
+				reason:    "add_header inside location blocks is not supported",
+			})
 
 		case "fastcgi_pass":
 			if len(inner.Args) > 0 {
@@ -563,7 +576,7 @@ func (mc *migrateConf) convertLocationBlock(
 					})
 					mc.report.stubbed++
 					mc.report.entries = append(mc.report.entries, reportEntry{
-						vhost:     d.Directive,
+						vhost:     vh.hostname,
 						directive: inner.Directive,
 						line:      inner.Line,
 						reason:    reason[0],
